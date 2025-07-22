@@ -61,17 +61,15 @@ class BaseWordsMismatch(abc.ABC):
         self._count_phn = []
 
     @classmethod
-    def _count_words(
-            cls,
-            text: List[str],
-            wordsep: Union[str, re.Pattern] = _RE_SPACES) -> List[int]:
+    def _count_words(cls, text, wordsep=None):
         """Return the number of words contained in each line of `text`"""
-        if not isinstance(wordsep, re.Pattern):
-            wordsep = re.escape(wordsep)
-
         return [
-            len([w for w in re.split(wordsep, line.strip()) if w])
+            len([w for w in line.strip().split(wordsep) if w])
             for line in text]
+
+    def count_phonemized(self, text, wordsep=None):
+        """Stores the number of words in each output line"""
+        self._count_phn = self._count_words(text, wordsep)
 
     def _mismatched_lines(self) -> List[Tuple[int, int, int]]:
         """Returns a list of (num_line, nwords_input, nwords_output)
@@ -101,10 +99,6 @@ class BaseWordsMismatch(abc.ABC):
     def count_text(self, text: List[str]):
         """Stores the number of words in each input line"""
         self._count_txt = self._count_words(text)
-
-    def count_phonemized(self, text: List[str], separator: Separator):
-        """Stores the number of words in each output line"""
-        self._count_phn = self._count_words(text, separator.word)
 
     @abc.abstractmethod
     def process(self, text: List[str]) -> List[str]:
