@@ -12,161 +12,239 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with phonemizer. If not, see <http://www.gnu.org/licenses/>.
-"""Espeak backend for the phonemizer"""
+"""Abstract base class for phonemization backends"""
 
+import abc
 import itertools
 import re
 from logging import Logger
-from typing import Optional, Tuple, List, Union, Pattern
+from typing import Optional, List, Any, Dict, Tuple, Union, Pattern
 
-from phonemizer.backend.espeak.base import BaseEspeakBackend
-from phonemizer.backend.espeak.language_switch import (
-    get_language_switch_processor, LanguageSwitch, BaseLanguageSwitch)
-from phonemizer.backend.espeak.words_mismatch import (
-    get_words_mismatch_processor, WordMismatch, BaseWordsMismatch)
-from phonemizer.backend.espeak.wrapper import EspeakWrapper
-from phonemizer.separator import Separator
+import joblib
+
+from phonemizer.logger import get_logger
+from phonemizer.punctuation import Punctuation
+from phonemizer.separator import Separator, default_separator
+from phonemizer.utils import chunks
 
 
-class EspeakBackend(BaseEspeakBackend):
-    """Espeak backend for the phonemizer"""
-    # a regular expression to find phonemes stresses in espeak output
-    _ESPEAK_STRESS_RE = re.compile(r"[ˈˌ'-]+")
+class BaseBackend(abc.ABC):
+    """Abstract base class of all the phonemization backends
 
-    # pylint: disable=too-many-arguments
+    Provides a common interface to all backends. The central method is
+    `phonemize()`
+
+    Parameters
+    ----------
+    language: str
+        The language code of the input text, must be supported by
+        the backend. If ``backend`` is 'segments', the language can be a file with
+        a grapheme to phoneme mapping.
+
+    preserve_punctuation: bool
+        When True, will keep the punctuation in the
+        phonemized output. Not supported by the 'espeak-mbrola' backend. Default
+        to False and remove all the punctuation.
+
+    punctuation_marks: str
+        The punctuation marks to consider when dealing with punctuation, either for removal or preservation.
+        Can be defined as a string or regular expression. Default to Punctuation.default_marks().
+
+    logger: logging.Logger
+        the logging instance where to send
+        messages. If not specified, use the default system logger.
+
+    Raises
+    ------
+    RuntimeError
+        if the backend is not available of if the `language` cannot be initialized.
+
+    """
+
     def __init__(self, language: str,
                  punctuation_marks: Optional[Union[str, Pattern]] = None,
                  preserve_punctuation: bool = False,
-                 with_stress: bool = False,
-                 tie: Union[bool, str] = False,
-                 language_switch: LanguageSwitch = 'keep-flags',
-                 words_mismatch: WordMismatch = 'ignore',
                  logger: Optional[Logger] = None):
-        super().__init__(
-            language, punctuation_marks=punctuation_marks,
-            preserve_punctuation=preserve_punctuation, logger=logger)
 
-        self._espeak.set_voice(language)
-        self._with_stress = with_stress
-        self._tie = self._init_tie(tie)
-        self._lang_switch: BaseLanguageSwitch = get_language_switch_processor(
-            language_switch, self.logger, self.language)
-        self._words_mismatch: BaseWordsMismatch = get_words_mismatch_processor(
-            words_mismatch, self.logger)
+        if punctuation_marks is None:
+            punctuation_marks = Punctuation.default_marks()
 
-    @staticmethod
-    def _init_tie(tie) -> Optional[str]:
-        if not tie:
-            return None
+        if logger is None:
+            logger = get_logger()
 
-        if tie is True:  # default U+361 tie character
-            return '͡'
+        # ensure the backend is installed on the system
+        if not self.is_available():
+            raise RuntimeError(  # pragma: nocover
+                '{} not installed on your system'.format(self.name()))
 
-        # non default tie charcacter
-        tie = str(tie)
-        if len(tie) != 1:
-            raise RuntimeError(
-                f'explicit tie must be a single charcacter but is {tie}')
-        return tie
+        self._logger = logger
+        self._logger.info(
+            'initializing backend %s-%s',
+            self.name(), '.'.join(str(v) for v in self.version()))
 
-    @staticmethod
-    def name():
-        return 'espeak'
+        # ensure the backend support the requested language
+        self._language = self._init_language(language)
+
+        # setup punctuation processing
+        self._preserve_punctuation = preserve_punctuation
+        self._punctuator = Punctuation(punctuation_marks)
 
     @classmethod
-    def supported_languages(cls):
-        return {
-            voice.language: voice.name
-            for voice in EspeakWrapper().available_voices()}
+    def _init_language(cls, language):
+        """Language initialization
 
-    def _phonemize_aux(self, text, offset, separator, strip):
-        if self._tie is not None and separator.phone:
-            self.logger.warning(
-                'cannot use ties AND phone separation, '
-                'ignoring phone separator')
-
-        output = []
-        lang_switches = []
-        for num, line in enumerate(text, start=1):
-            line = self._espeak.text_to_phonemes(line, self._tie)
-            line, has_switch = self._postprocess_line(
-                line, num, separator, strip)
-            output.append(line)
-            if has_switch:
-                lang_switches.append(num + offset)
-
-        return output, lang_switches
-
-    def _process_stress(self, word):
-        if self._with_stress:
-            return word
-        # remove the stresses on phonemes
-        return re.sub(self._ESPEAK_STRESS_RE, '', word)
-
-    def _process_tie(self, word: str, separator: Separator):
-        # NOTE a bug in espeak append ties to (en) flags so as (͡e͡n).
-        # We do not correct it here.
-        if self._tie is not None and self._tie != '͡':
-            # replace default '͡' by the requested one
-            return word.replace('͡', self._tie)
-        return word.replace('_', separator.phone)
-
-    def _postprocess_line(self, line: str, num: int,
-                          separator: Separator, strip: bool) -> Tuple[str, bool]:
-        # espeak can split an utterance into several lines because
-        # of punctuation, here we merge the lines into a single one
-        line = line.strip().replace('\n', ' ').replace('  ', ' ')
-
-        # due to a bug in espeak-ng, some additional separators can be
-        # added at the end of a word. Here a quick fix to solve that
-        # issue. See https://github.com/espeak-ng/espeak-ng/issues/694
-        line = re.sub(r'_+', '_', line)
-        line = re.sub(r'_ ', ' ', line)
-
-        line, has_switch = self._lang_switch.process(line)
-        if not line:
-            return '', has_switch
-
-        out_line = ''
-        for word in line.split(' '):
-            word = self._process_stress(word.strip())
-            if not strip and self._tie is None:
-                word += '_'
-            word = self._process_tie(word, separator)
-            out_line += word + separator.word
-
-        if strip and separator.word:
-            # erase the last word separator from the line
-            out_line = out_line[:-len(separator.word)]
-
-        return out_line, has_switch
-
-    def _phonemize_preprocess(self, text: List[str]) -> Tuple[Union[str, List[str]], List]:
-        text, punctuation_marks = super()._phonemize_preprocess(text)
-        self._words_mismatch.count_text(text)
-        return text, punctuation_marks
-
-    def _phonemize_postprocess(self, phonemized, punctuation_marks, separator, strip=True):
-        text = phonemized[0]
-        switches = phonemized[1]
-
-        self._words_mismatch.count_phonemized(text, separator.word)
-        self._lang_switch.warning(switches)
-
-        phonemized = super()._phonemize_postprocess(text, punctuation_marks, separator, strip)
-        return self._words_mismatch.process(phonemized)
-
-    @staticmethod
-    def _flatten(phonemized) -> List:
-        """Specialization of BaseBackend._flatten for the espeak backend
-
-        From [([1, 2], ['a', 'b']), ([3],), ([4], ['c'])] to [[1, 2, 3, 4],
-        ['a', 'b', 'c']].
+        This method may be overloaded in child classes (see Segments backend)
 
         """
-        flattened = []
-        for i in range(len(phonemized[0])):
-            flattened.append(
-                list(itertools.chain(
-                    c for chunk in phonemized for c in chunk[i])))
-        return flattened
+        if not cls.is_supported_language(language):
+            raise RuntimeError(
+                f'language "{language}" is not supported by the '
+                f'{cls.name()} backend')
+        return language
+
+    @property
+    def logger(self):
+        """A logging.Logger instance where to send messages"""
+        return self._logger
+
+    @property
+    def language(self):
+        """The language code configured to be used for phonemization"""
+        return self._language
+
+    @staticmethod
+    @abc.abstractmethod
+    def name():
+        """The name of the backend"""
+
+    @classmethod
+    @abc.abstractmethod
+    def is_available(cls):
+        """Returns True if the backend is installed, False otherwise"""
+
+    @classmethod
+    @abc.abstractmethod
+    def version(cls):
+        """Return the backend version as a tuple (major, minor, patch)"""
+
+    @staticmethod
+    @abc.abstractmethod
+    def supported_languages() -> Dict[str, str]:
+        """Return a dict of language codes -> name supported by the backend"""
+
+    @classmethod
+    def is_supported_language(cls, language: str):
+        """Returns True if `language` is supported by the backend"""
+        return language in cls.supported_languages()
+
+    def phonemize(self, text, separator=default_separator,
+                  strip=False, njobs=1):
+        """Returns the `text` phonemized for the given language
+
+        Parameters
+        ----------
+        text: list of str
+            The text to be phonemized. Each string in the list
+            is considered as a separated line. Each line is considered as a text
+            utterance. Any empty utterance will be ignored.
+
+        separator: Separator
+            string separators between phonemes, syllables
+            and words, default to separator.default_separator. Syllable separator
+            is considered only for the festival backend. Word separator is
+            ignored by the 'espeak-mbrola' backend.
+
+        strip: bool
+            If True, don't output the last word and phone separators
+            of a token, default to False.
+
+        njobs : int
+            The number of parallel jobs to launch. The input text is
+            split in ``njobs`` parts, phonemized on parallel instances of the
+            backend and the outputs are finally collapsed.
+
+        Returns
+        -------
+        phonemized text: list of str
+            The input ``text`` phonemized for the given ``language`` and ``backend``.
+
+        Raises
+        ------
+        RuntimeError
+            if something went wrong during the phonemization
+
+        """
+        if isinstance(text, str):
+            # changed in phonemizer-3.0, warn the user
+            raise RuntimeError(
+                'input text to phonemize() is str but it must be list of str')
+
+        if separator is None:
+            separator = default_separator
+
+        text, punctuation_marks = self._phonemize_preprocess(text)
+
+        if njobs == 1:
+            # phonemize the text forced as a string
+            phonemized = self._phonemize_aux(text, 0, separator, strip)
+        else:
+            # If using parallel jobs, disable the log as stderr is not
+            # picklable.
+            self.logger.info('running %s on %s jobs', self.name(), njobs)
+
+            # we have here a list of phonemized chunks
+            phonemized = joblib.Parallel(n_jobs=njobs)(
+                joblib.delayed(self._phonemize_aux)(
+                    # chunk[0] is the text, chunk[1] is the offset
+                    chunk[0], chunk[1], separator, strip)
+                for chunk in zip(*chunks(text, njobs)))
+
+            # flatten them in a single list
+            phonemized = self._flatten(phonemized)
+
+        return self._phonemize_postprocess(phonemized, punctuation_marks, separator)
+
+    @staticmethod
+    def _flatten(phonemized: List[List[Any]]):
+        """Flatten a list of lists into a single one
+
+        From [[1, 2], [3], [4]] returns [1, 2, 3, 4]. This method is used to
+        format the output as obtained using multiple jobs.
+
+        """
+        return list(itertools.chain(*phonemized))
+
+    @abc.abstractmethod
+    def _phonemize_aux(self, text: List[str], offset: int, separator: Separator, strip: bool) -> List[str]:
+        """The "concrete" phonemization method
+
+        Must be implemented in child classes. `separator` and `strip`
+        parameters are as given to the phonemize() method. `text` is as
+        returned by _phonemize_preprocess(). `offset` is line number of the
+        first line in `text` with respect to the original text (this is only
+        usefull with running on chunks in multiple jobs. When using a single
+        jobs the offset is 0).
+
+        """
+
+    def _phonemize_preprocess(self, text: List[str]) -> Tuple[Union[str, List[str]], List]:
+        """Preprocess the text before phonemization
+
+        Removes the punctuation (keep trace of punctuation marks for further
+        restoration if required by the `preserve_punctuation` option).
+
+        """
+        if self._preserve_punctuation:
+            # a tuple (text, punctuation marks)
+            return self._punctuator.preserve(text)
+        return self._punctuator.remove(text), []
+
+    def _phonemize_postprocess(self, phonemized, punctuation_marks, separator):
+        """Postprocess the raw phonemized output
+
+        Restores the punctuation as needed.
+
+        """
+        if self._preserve_punctuation:
+            return self._punctuator.restore(phonemized, punctuation_marks, separator, strip)
+        return phonemized
