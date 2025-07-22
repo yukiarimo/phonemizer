@@ -19,7 +19,7 @@ import re
 from logging import Logger
 from typing import Optional, Tuple, List, Union, Pattern
 
-from phonemizer.backend.espeak.base import BaseEspeakBackend
+from phonemizer.backend.base import BaseBackend
 from phonemizer.backend.espeak.language_switch import (
     get_language_switch_processor, LanguageSwitch, BaseLanguageSwitch)
 from phonemizer.backend.espeak.words_mismatch import (
@@ -28,7 +28,7 @@ from phonemizer.backend.espeak.wrapper import EspeakWrapper
 from phonemizer.separator import Separator
 
 
-class EspeakBackend(BaseEspeakBackend):
+class EspeakBackend(BaseBackend):
     """Espeak backend for the phonemizer"""
     # a regular expression to find phonemes stresses in espeak output
     _ESPEAK_STRESS_RE = re.compile(r"[ˈˌ'-]+")
