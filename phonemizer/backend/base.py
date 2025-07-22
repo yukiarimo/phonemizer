@@ -137,10 +137,8 @@ class BaseBackend(abc.ABC):
         """Returns True if `language` is supported by the backend"""
         return language in cls.supported_languages()
 
-    def phonemize(self, text: List[str],
-                  separator: Optional[Separator] = None,
-                  strip: bool = False,
-                  njobs: int = 1) -> List[str]:
+    def phonemize(self, text, separator=default_separator,
+                  strip=False, njobs=1):
         """Returns the `text` phonemized for the given language
 
         Parameters
@@ -204,7 +202,7 @@ class BaseBackend(abc.ABC):
             # flatten them in a single list
             phonemized = self._flatten(phonemized)
 
-        return self._phonemize_postprocess(phonemized, punctuation_marks, separator, strip)
+        return self._phonemize_postprocess(phonemized, punctuation_marks, separator)
 
     @staticmethod
     def _flatten(phonemized: List[List[Any]]):
@@ -241,10 +239,7 @@ class BaseBackend(abc.ABC):
             return self._punctuator.preserve(text)
         return self._punctuator.remove(text), []
 
-    def _phonemize_postprocess(self, phonemized: List[str],
-                               punctuation_marks,
-                               separator: Separator,
-                               strip: bool):
+    def _phonemize_postprocess(self, phonemized, punctuation_marks, separator):
         """Postprocess the raw phonemized output
 
         Restores the punctuation as needed.
