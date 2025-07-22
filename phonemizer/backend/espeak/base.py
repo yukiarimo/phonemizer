@@ -12,102 +12,161 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with phonemizer. If not, see <http://www.gnu.org/licenses/>.
-"""Base class of espeak backends for the phonemizer"""
+"""Espeak backend for the phonemizer"""
 
-import abc
+import itertools
+import re
 from logging import Logger
-from typing import Optional, Union, Pattern
+from typing import Optional, Tuple, List, Union, Pattern
 
-from phonemizer.backend.base import BaseBackend
+from phonemizer.backend.espeak.base import BaseEspeakBackend
+from phonemizer.backend.espeak.language_switch import (
+    get_language_switch_processor, LanguageSwitch, BaseLanguageSwitch)
+from phonemizer.backend.espeak.words_mismatch import (
+    get_words_mismatch_processor, WordMismatch, BaseWordsMismatch)
 from phonemizer.backend.espeak.wrapper import EspeakWrapper
-from phonemizer.logger import get_logger
-from phonemizer.punctuation import Punctuation
 from phonemizer.separator import Separator
 
 
-class BaseEspeakBackend(BaseBackend):
-    """Abstract espeak backend for the phonemizer
+class EspeakBackend(BaseEspeakBackend):
+    """Espeak backend for the phonemizer"""
+    # a regular expression to find phonemes stresses in espeak output
+    _ESPEAK_STRESS_RE = re.compile(r"[ˈˌ'-]+")
 
-    Base class of the concrete backends Espeak and EspeakMbrola. It provides
-    facilities to find espeak library and read espeak version.
-
-    """
+    # pylint: disable=too-many-arguments
     def __init__(self, language: str,
                  punctuation_marks: Optional[Union[str, Pattern]] = None,
                  preserve_punctuation: bool = False,
+                 with_stress: bool = False,
+                 tie: Union[bool, str] = False,
+                 language_switch: LanguageSwitch = 'keep-flags',
+                 words_mismatch: WordMismatch = 'ignore',
                  logger: Optional[Logger] = None):
         super().__init__(
-            language,
-            punctuation_marks=punctuation_marks,
-            preserve_punctuation=preserve_punctuation,
-            logger=logger)
+            language, punctuation_marks=punctuation_marks,
+            preserve_punctuation=preserve_punctuation, logger=logger)
 
-        self._espeak = EspeakWrapper()
-        self.logger.debug('loaded %s', self._espeak.library_path)
+        self._espeak.set_voice(language)
+        self._with_stress = with_stress
+        self._tie = self._init_tie(tie)
+        self._lang_switch: BaseLanguageSwitch = get_language_switch_processor(
+            language_switch, self.logger, self.language)
+        self._words_mismatch: BaseWordsMismatch = get_words_mismatch_processor(
+            words_mismatch, self.logger)
 
+    @staticmethod
+    def _init_tie(tie) -> Optional[str]:
+        if not tie:
+            return None
 
-    @classmethod
-    def set_library(cls, library):
-        """Sets the espeak backend to use `library`
+        if tie is True:  # default U+361 tie character
+            return '͡'
 
-        If this is not set, the backend uses the default espeak shared library
-        from the system installation.
+        # non default tie charcacter
+        tie = str(tie)
+        if len(tie) != 1:
+            raise RuntimeError(
+                f'explicit tie must be a single charcacter but is {tie}')
+        return tie
 
-        Parameters
-        ----------
-        library (str or None) : the path to the espeak shared library to use as
-            backend. Set `library` to None to restore the default.
-
-        """
-        EspeakWrapper.set_library(library)
-
-    @classmethod
-    def library(cls):
-        """Returns the espeak library used as backend
-
-        The following precedence rule applies for library lookup:
-
-        1. As specified by BaseEspeakBackend.set_library()
-        2. Or as specified by the environment variable
-           PHONEMIZER_ESPEAK_LIBRARY
-        3. Or the default espeak library found on the system
-
-        Raises
-        ------
-        RuntimeError if the espeak library cannot be found or if the
-            environment variable PHONEMIZER_ESPEAK_LIBRARY is set to a
-            non-readable file
-
-        """
-        return EspeakWrapper.library()
+    @staticmethod
+    def name():
+        return 'espeak'
 
     @classmethod
-    def is_available(cls) -> bool:
-        try:
-            EspeakWrapper()
-        except RuntimeError:  # pragma: nocover
-            return False
-        return True
+    def supported_languages(cls):
+        return {
+            voice.language: voice.name
+            for voice in EspeakWrapper().available_voices()}
 
-    @classmethod
-    def is_espeak_ng(cls) -> bool:
-        """Returns True if using espeak-ng, False otherwise"""
-        # espeak-ng starts with version 1.49
-        return cls.version() >= (1, 49)
+    def _phonemize_aux(self, text, offset, separator, strip):
+        if self._tie is not None and separator.phone:
+            self.logger.warning(
+                'cannot use ties AND phone separation, '
+                'ignoring phone separator')
 
-    @classmethod
-    def version(cls):
-        """Espeak version as a tuple (major, minor, patch)
+        output = []
+        lang_switches = []
+        for num, line in enumerate(text, start=1):
+            line = self._espeak.text_to_phonemes(line, self._tie)
+            line, has_switch = self._postprocess_line(
+                line, num, separator, strip)
+            output.append(line)
+            if has_switch:
+                lang_switches.append(num + offset)
 
-        Raises
-        ------
-        RuntimeError if BaseEspeakBackend.is_available() is False or if the
-            version cannot be extracted for some reason.
+        return output, lang_switches
 
-        """
-        return EspeakWrapper().version
+    def _process_stress(self, word):
+        if self._with_stress:
+            return word
+        # remove the stresses on phonemes
+        return re.sub(self._ESPEAK_STRESS_RE, '', word)
 
-    @abc.abstractmethod
+    def _process_tie(self, word: str, separator: Separator):
+        # NOTE a bug in espeak append ties to (en) flags so as (͡e͡n).
+        # We do not correct it here.
+        if self._tie is not None and self._tie != '͡':
+            # replace default '͡' by the requested one
+            return word.replace('͡', self._tie)
+        return word.replace('_', separator.phone)
+
     def _postprocess_line(self, line: str, num: int,
-                          separator: Separator, strip: bool) -> str:
-        pass
+                          separator: Separator, strip: bool) -> Tuple[str, bool]:
+        # espeak can split an utterance into several lines because
+        # of punctuation, here we merge the lines into a single one
+        line = line.strip().replace('\n', ' ').replace('  ', ' ')
+
+        # due to a bug in espeak-ng, some additional separators can be
+        # added at the end of a word. Here a quick fix to solve that
+        # issue. See https://github.com/espeak-ng/espeak-ng/issues/694
+        line = re.sub(r'_+', '_', line)
+        line = re.sub(r'_ ', ' ', line)
+
+        line, has_switch = self._lang_switch.process(line)
+        if not line:
+            return '', has_switch
+
+        out_line = ''
+        for word in line.split(' '):
+            word = self._process_stress(word.strip())
+            if not strip and self._tie is None:
+                word += '_'
+            word = self._process_tie(word, separator)
+            out_line += word + separator.word
+
+        if strip and separator.word:
+            # erase the last word separator from the line
+            out_line = out_line[:-len(separator.word)]
+
+        return out_line, has_switch
+
+    def _phonemize_preprocess(self, text: List[str]) -> Tuple[Union[str, List[str]], List]:
+        text, punctuation_marks = super()._phonemize_preprocess(text)
+        self._words_mismatch.count_text(text)
+        return text, punctuation_marks
+
+    def _phonemize_postprocess(self, phonemized, punctuation_marks, separator, strip=True):
+        text = phonemized[0]
+        switches = phonemized[1]
+
+        self._words_mismatch.count_phonemized(text, separator.word)
+        self._lang_switch.warning(switches)
+
+        phonemized = super()._phonemize_postprocess(text, punctuation_marks, separator, strip)
+        return self._words_mismatch.process(phonemized)
+
+    @staticmethod
+    def _flatten(phonemized) -> List:
+        """Specialization of BaseBackend._flatten for the espeak backend
+
+        From [([1, 2], ['a', 'b']), ([3],), ([4], ['c'])] to [[1, 2, 3, 4],
+        ['a', 'b', 'c']].
+
+        """
+        flattened = []
+        for i in range(len(phonemized[0])):
+            flattened.append(
+                list(itertools.chain(
+                    c for chunk in phonemized for c in chunk[i])))
+        return flattened
